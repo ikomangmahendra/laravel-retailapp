@@ -6,11 +6,12 @@ have touched every layer Laravel expects you to touch for a resource:
 migration → model → factory/seeder → form requests → controller → routes →
 views.
 
-The `Product` feature in this repo follows the exact same pattern and is a
-little more involved (foreign key, more fields, search/filter). Once you've
-built `Category` here, the workshop exercise at the end asks you to read
-`Product`'s files cold and explain what each one does — that's the real test
-of whether the pattern stuck.
+Once you've built `Category`, Part Two walks through `Product` — the same
+eight steps again, but with the three things `Category` doesn't have to
+deal with: a foreign key to another model, a boolean checkbox, and a
+search/filter query on the index page. By the end of Part Two you'll have
+built two complete resources, and the closing exercise asks you to build a
+third one entirely on your own.
 
 ## Prerequisites
 
@@ -178,21 +179,9 @@ $this->call([
 ]);
 ```
 
-Order matters here: `ProductSeeder` needs categories to already exist so it
-can attach products to them (more on that pitfall below).
-
-> **Pitfall we hit building this repo:** `ProductFactory`'s definition
-> defaults `category_id` to `Category::factory()`. If a seeder calls
-> `Product::factory()->count(20)->make()` and then manually overwrites
-> `category_id` before saving, Laravel *still silently creates* 20 extra
-> throwaway categories in the database — because factory relationships
-> resolve (and persist) as soon as the definition array is built, regardless
-> of whether the *parent* model is `make()`'d or `create()`'d. The fix is
-> `Product::factory()->count(20)->recycle(Category::all())->create()` —
-> `recycle()` tells the factory "reuse one of these instead of making a new
-> one" for any nested factory relationship. Worth knowing before you spend
-> twenty minutes wondering why your categories table has 25 rows instead
-> of 5.
+Order matters here: `ProductSeeder` (Part Two) needs categories to already
+exist so it can attach products to them — that's why `CategorySeeder` is
+listed first.
 
 ---
 
@@ -470,7 +459,7 @@ of just returning a view directly after `store()`/`update()`/`destroy()`.
 
 ---
 
-## Checking your work
+## Checking your work (Part One)
 
 ```bash
 php artisan route:list --name=categories   # confirm all 6 routes exist
@@ -485,26 +474,355 @@ disappear too).
 
 ---
 
-## Your turn: read `Product` cold
+# Part Two: Product — a feature slice with a foreign key
 
-`app/Http/Controllers/ProductController.php`,
-`app/Http/Requests/{Store,Update}ProductRequest.php`, and
-`resources/views/products/*.blade.php` implement the identical pattern,
-plus three things `Category` doesn't have to deal with. Before looking at
-the code, guess how each is solved — then go check:
+Same eight steps, same order. This time the model has a relationship to
+another table, a boolean flag, and the index page needs search and
+filtering — three things that come up in almost every real-world CRUD
+screen, so it's worth seeing how each is handled once, carefully.
 
-1. **A foreign key to another model.** How does the `category_id` field
-   get validated, and how does the `<select>` in the form get its list of
-   categories to choose from?
-2. **A boolean checkbox (`is_active`).** Unchecked HTML checkboxes send
-   *no value at all* — so how does unchecking "Active" and saving actually
-   turn the value off in the database, instead of just leaving it
-   untouched? (Hint: look for a `type="hidden"` input right before the
-   checkbox in `products/_form.blade.php`.)
-3. **Search and category filtering on the index page.** `ProductController@index`
-   builds its query with `->when(...)` twice. What does each condition
-   check, and what happens to the URL when you submit the filter form?
+## Step 1 — Migration
 
-If you can explain those three answers in your own words, you've
-internalized the pattern well enough to build a third resource
-(`Supplier`? `Warehouse`?) from scratch using this same eight-step recipe.
+```bash
+php artisan make:model Product -mf
+```
+
+`database/migrations/..._create_products_table.php`:
+
+```php
+public function up(): void
+{
+    Schema::create('products', function (Blueprint $table) {
+        $table->id();
+        $table->foreignId('category_id')->constrained()->cascadeOnDelete();
+        $table->string('sku')->unique();
+        $table->string('name');
+        $table->decimal('purchase_price', 12, 2);
+        $table->decimal('selling_price', 12, 2);
+        $table->integer('stock')->default(0);
+        $table->string('unit');
+        $table->boolean('is_active')->default(true);
+        $table->timestamps();
+    });
+}
+```
+
+`foreignId('category_id')->constrained()` is shorthand for "add an
+unsigned big integer column named `category_id`, and add a foreign key
+constraint against the `id` column of whatever table its name implies" —
+Laravel infers `categories` from `category_id` the same way it inferred
+the relationship method earlier. `->cascadeOnDelete()` is the database-level
+enforcement of "deleting a category deletes its products" — it's not
+application code, it's a constraint MySQL itself enforces, so it holds
+even if a product gets deleted through `mysql` directly instead of through
+this app.
+
+`decimal('purchase_price', 12, 2)` — money should almost never be a
+`float`/`double` column, because binary floating point can't represent
+every decimal fraction exactly and rounding errors compound. `decimal(12, 2)`
+stores exactly 2 digits after the decimal point with up to 12 digits
+total, and MySQL does the arithmetic in fixed-point, not floating-point.
+
+## Step 2 — Model
+
+```php
+class Product extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'category_id',
+        'sku',
+        'name',
+        'purchase_price',
+        'selling_price',
+        'stock',
+        'unit',
+        'is_active',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'purchase_price' => 'decimal:2',
+            'selling_price' => 'decimal:2',
+            'stock' => 'integer',
+            'is_active' => 'boolean',
+        ];
+    }
+
+    public function category(): BelongsTo
+    {
+        return $this->belongsTo(Category::class);
+    }
+}
+```
+
+Two new things compared to `Category`:
+
+- **`casts()`** tells Eloquent how to convert database values into PHP
+  types when you read the attribute, and back when you write it. Without
+  the `boolean` cast, `is_active` would come back from MySQL as the string
+  `"1"` or `"0"` — which is truthy in PHP either way, silently breaking any
+  `if ($product->is_active)` check on an inactive product. Without the
+  `decimal:2` cast, floating-point columns can print with binary rounding
+  artifacts (`19.989999999999998` instead of `19.99`) once you start doing
+  arithmetic on them.
+- **`belongsTo`** is the inverse of `Category`'s `hasMany`. The convention
+  is symmetrical: `belongsTo(Category::class)` looks for a `category_id`
+  column on *this* model's own table (`products`) — no argument needed,
+  because Laravel derives both the method name and the column name from
+  it the same way as before.
+
+## Step 3 — Factory
+
+```php
+public function definition(): array
+{
+    $purchasePrice = $this->faker->randomFloat(2, 5, 500);
+
+    return [
+        'category_id' => Category::factory(),
+        'sku' => strtoupper($this->faker->unique()->bothify('SKU-####??')),
+        'name' => ucfirst($this->faker->words(3, true)),
+        'purchase_price' => $purchasePrice,
+        'selling_price' => round($purchasePrice * $this->faker->randomFloat(2, 1.1, 1.6), 2),
+        'stock' => $this->faker->numberBetween(0, 200),
+        'unit' => $this->faker->randomElement(['pcs', 'box', 'kg', 'pack']),
+        'is_active' => $this->faker->boolean(90),
+    ];
+}
+```
+
+`'category_id' => Category::factory()` is how a factory expresses "this
+column is a foreign key — generate (or reuse) a related model for it."
+Deriving `selling_price` from `purchase_price` with a random markup
+(instead of two independent random numbers) is a small touch that makes
+fake data look real: a retail catalog where the selling price is
+*unrelated* to the purchase price would look obviously fake in a demo.
+`$this->faker->boolean(90)` means a 90% chance of `true` — most seeded
+products should be active, with a handful inactive to exercise that state.
+
+## Step 4 — Seeder
+
+```php
+public function run(): void
+{
+    Product::factory()
+        ->count(20)
+        ->recycle(Category::all())
+        ->create();
+}
+```
+
+> **Pitfall we hit building this repo:** the first version of this seeder
+> called `Product::factory()->count(20)->make()`, then manually overwrote
+> `category_id` on each instance with a random existing category ID before
+> saving — the intent being "don't let the factory create its own throwaway
+> categories, reuse the ones from `CategorySeeder`." It didn't work: even
+> though the *product* was only `make()`'d (not yet saved), the *nested*
+> `Category::factory()` inside `ProductFactory`'s `definition()` still
+> resolved and **persisted** a brand-new category to the database the
+> moment the definition array was built — regardless of whether the parent
+> model was ultimately saved or not. Running the seeder left 25 rows in
+> `categories` instead of 5.
+>
+> The fix is `recycle(Category::all())`: it tells the factory "wherever
+> your definition would create a new related model via `Category::factory()`,
+> reuse one of these existing instances instead." Any time a factory's
+> `definition()` references another model's factory, ask yourself whether
+> you actually want a *fresh* related row every time, or whether you want
+> to spread new records across an *existing* set — `recycle()` is how you
+> ask for the latter.
+
+## Step 5 — Form Requests
+
+```bash
+php artisan make:request StoreProductRequest
+php artisan make:request UpdateProductRequest
+```
+
+`app/Http/Requests/StoreProductRequest.php`:
+
+```php
+public function rules(): array
+{
+    return [
+        'category_id' => ['required', 'integer', 'exists:categories,id'],
+        'sku' => ['required', 'string', 'max:255', 'unique:products,sku'],
+        'name' => ['required', 'string', 'max:255'],
+        'purchase_price' => ['required', 'numeric', 'min:0'],
+        'selling_price' => ['required', 'numeric', 'min:0'],
+        'stock' => ['required', 'integer', 'min:0'],
+        'unit' => ['required', 'string', 'max:50'],
+        'is_active' => ['boolean'],
+    ];
+}
+```
+
+`'exists:categories,id'` is the validation-layer counterpart to the
+migration's `->constrained()` — it rejects a submitted `category_id` that
+doesn't correspond to a real row, with a friendly form error, *before* the
+database's foreign key constraint would have thrown a much uglier
+`QueryException`. `min:0` on `purchase_price`/`selling_price`/`stock` is
+exactly the schema requirement from the spec — Laravel's `numeric` and
+`integer` rules stop non-numbers early, and `min:0` stops negative values.
+
+`UpdateProductRequest` is identical except the `sku` uniqueness rule
+ignores the current product, exactly like `name` did for
+`UpdateCategoryRequest`:
+
+```php
+Rule::unique('products', 'sku')->ignore($this->route('product')),
+```
+
+## Step 6 — Controller
+
+The three new methods worth reading closely are all in `index()`:
+
+```php
+public function index(Request $request): View
+{
+    $search = $request->string('search')->trim()->toString();
+    $categoryId = $request->integer('category_id');
+
+    $products = Product::query()
+        ->with('category')
+        ->when($search !== '', function ($query) use ($search) {
+            $query->where(function ($query) use ($search) {
+                $query->where('name', 'like', "%{$search}%")
+                    ->orWhere('sku', 'like', "%{$search}%");
+            });
+        })
+        ->when($categoryId, fn ($query) => $query->where('category_id', $categoryId))
+        ->orderBy('name')
+        ->paginate(10)
+        ->withQueryString();
+
+    $categories = Category::query()->orderBy('name')->get();
+
+    return view('products.index', compact('products', 'categories', 'search', 'categoryId'));
+}
+```
+
+- **`->with('category')`** eager-loads the related category for every
+  product in *one* extra query. Leave it out and the index view's
+  `{{ $product->category->name }}` would fire one additional query *per
+  row* on the page — the classic N+1 problem.
+- **`->when($condition, $callback)`** only applies the callback if
+  `$condition` is truthy — this is how "search" and "filter" become
+  optional instead of always-required. When `$search` is empty, that whole
+  `where` clause is skipped entirely rather than matching `LIKE '%%'`
+  (which would technically also match everything, but skipping it is
+  clearer and cheaper).
+- **`->withQueryString()`** on the paginator is why clicking "page 2"
+  doesn't lose your search term or category filter — it appends the
+  current request's query string (`?search=...&category_id=...`) to every
+  pagination link it generates.
+
+## Step 7 — Routes
+
+No new routing concept here — `Route::resource('products',
+ProductController::class)->except('show')` sits right next to the
+categories line in the same `auth`+`verified` group from Part One. Worth
+noticing, though: one line of routing code serves both `/products` (no
+query string) and `/products?search=foo&category_id=3` — query string
+parameters were never part of route *definition*, only something the
+controller reads off the `Request` object at runtime.
+
+## Step 8 — Views
+
+The `_form.blade.php` partial has the two new field types:
+
+```blade
+<select id="category_id" name="category_id" required>
+    <option value="">{{ __('Select a category') }}</option>
+    @foreach ($categories as $category)
+        <option value="{{ $category->id }}"
+            @selected(old('category_id', $product->category_id ?? '') == $category->id)>
+            {{ $category->name }}
+        </option>
+    @endforeach
+</select>
+```
+
+Same `old(...) ?? ''` fallback pattern as `Category`'s form, just applied
+to a `<select>` instead of a text input — `@selected(...)` is Blade's
+shorthand for conditionally printing the `selected` attribute.
+
+```blade
+<input type="hidden" name="is_active" value="0" />
+<input type="checkbox" id="is_active" name="is_active" value="1"
+    @checked(old('is_active', $product->is_active ?? true))
+    ... />
+```
+
+This hidden-input-before-checkbox pairing is a standard HTML forms trick,
+not Laravel-specific: browsers only include a checkbox's `name`/`value` in
+the submitted form data **if it's checked** — an unchecked box sends
+nothing at all. If the hidden input weren't there, unchecking "Active" and
+saving would leave `is_active` completely absent from the request, and
+`$request->validated()` would never touch the column — the database value
+would just silently stay whatever it was before. The hidden input
+guarantees `is_active=0` is always sent as a fallback; if the checkbox
+*is* checked, its own `is_active=1` comes after it in the HTML and wins
+(the browser sends both, and the last one for a given name is what Laravel
+reads).
+
+`products/index.blade.php` adds the actual search/filter controls as a
+plain `GET` form:
+
+```blade
+<form method="GET" action="{{ route('products.index') }}">
+    <input type="text" name="search" value="{{ $search }}" placeholder="Search by name or SKU..." />
+    <select name="category_id">
+        <option value="">{{ __('All Categories') }}</option>
+        @foreach ($categories as $category)
+            <option value="{{ $category->id }}" @selected($categoryId === $category->id)>{{ $category->name }}</option>
+        @endforeach
+    </select>
+    <button type="submit">{{ __('Filter') }}</button>
+</form>
+```
+
+It's deliberately a `GET` form, not `POST` — filtering/searching is read-only,
+so it belongs in the URL (`?search=...`), which makes the result
+bookmarkable and shareable, and is exactly the query string
+`->withQueryString()` was preserving through pagination above.
+
+## Checking your work (Part Two)
+
+```bash
+php artisan migrate:fresh --seed   # 5 categories, 20 products
+php artisan serve
+```
+
+Log in, click **Products**, and check: search for a real SKU from the
+seeded data, filter by a category, page through results with a filter
+active (the filter should survive to page 2), create a product with a
+negative price (should be rejected), edit a product and uncheck "Active"
+(should actually save as inactive — this is the hidden-input trick from
+above actually working).
+
+---
+
+## Your turn: build a third resource on your own
+
+Everything above is one recipe, applied twice. Pick a third resource this
+retail app doesn't have yet — `Supplier` (`name`, `contact_email`,
+`phone`) is a reasonable scope, or invent your own — and build it end to
+end without copying an existing file line-for-line:
+
+1. `php artisan make:model Supplier -mf`, fill in the migration.
+2. Add `$fillable` and any relationships to the model.
+3. Fill in the factory's `definition()`.
+4. Write (or skip) a seeder.
+5. Generate `Store`/`UpdateSupplierRequest` with real validation rules.
+6. Generate a resource controller; wire up `index`/`create`/`store`/`edit`/`update`/`destroy`.
+7. Add one line to `routes/web.php` inside the existing `auth`+`verified` group.
+8. Build `index`/`create`/`edit`/`_form` views, reusing the Blade components
+   (`x-input-label`, `x-text-input`, `x-input-error`, `x-primary-button`)
+   you've now seen twice.
+
+If you get through all eight steps without opening `CategoryController.php`
+or `ProductController.php` for reference, the pattern has stuck.
