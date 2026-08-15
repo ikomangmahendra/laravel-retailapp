@@ -10,8 +10,13 @@ Once you've built `Category`, Part Two walks through `Product` — the same
 eight steps again, but with the three things `Category` doesn't have to
 deal with: a foreign key to another model, a boolean checkbox, and a
 search/filter query on the index page. By the end of Part Two you'll have
-built two complete resources, and the closing exercise asks you to build a
-third one entirely on your own.
+built two complete resources.
+
+Part Three then exposes both resources over a token-authenticated JSON
+API alongside the existing Blade UI — the same models and form requests,
+a different transport — and walks through a real bug this app shipped
+with along the way. The closing exercise asks you to build a third
+resource entirely on your own, web and API included.
 
 ## Prerequisites
 
@@ -806,12 +811,267 @@ above actually working).
 
 ---
 
+# Part Three: Adding a token-based API with Sanctum
+
+Parts One and Two built a browser-facing app: session cookies, CSRF
+tokens, Blade views. A lot of real clients — a mobile app, another
+service, a `curl` script — can't (and shouldn't have to) carry a
+browser session. This part adds a second, parallel way to reach the same
+`Category`/`Product` data: a JSON API authenticated with a bearer token,
+living entirely alongside the existing web routes rather than replacing
+them.
+
+The new pieces:
+
+| Layer | File | Job |
+|---|---|---|
+| Package | [`laravel/sanctum`](https://github.com/laravel/sanctum) | Issues/validates personal access tokens |
+| Migration | `database/migrations/..._create_personal_access_tokens_table.php` | Stores hashed tokens, one row per issued token |
+| Model trait | `HasApiTokens` on `app/Models/User.php` | Adds `createToken()` / `currentAccessToken()` to `User` |
+| Auth controller | `app/Http/Controllers/Api/AuthController.php` | Issues a token on login, revokes it on logout |
+| Routes | `routes/api.php` | Maps `/api/*` URLs to API controllers, guarded by `auth:sanctum` |
+| API controllers | `app/Http/Controllers/Api/CategoryController.php` / `ProductController.php` | Same query logic as the web controllers, but return JSON |
+| API resources | `app/Http/Resources/CategoryResource.php` / `ProductResource.php` | Shape the JSON response consistently |
+
+Notice what's reused rather than rebuilt: `StoreCategoryRequest`,
+`UpdateCategoryRequest`, `StoreProductRequest`, and `UpdateProductRequest`
+from Parts One and Two work unchanged here — validation rules don't care
+whether the response on failure is a redirect-with-errors or a 422 JSON
+body, so there was no reason to duplicate them.
+
+## Installing Sanctum
+
+```bash
+composer require laravel/sanctum
+php artisan install:api
+```
+
+`install:api` does three things in one go: publishes
+`config/sanctum.php`, generates and runs the
+`create_personal_access_tokens_table` migration, and registers
+`routes/api.php` in `bootstrap/app.php`:
+
+```php
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        web: __DIR__.'/../routes/web.php',
+        api: __DIR__.'/../routes/api.php',
+        commands: __DIR__.'/../routes/console.php',
+        health: '/up',
+    )
+    // ...
+```
+
+It also tells you, in its own output, to add one line to `User` yourself:
+
+```php
+use Laravel\Sanctum\HasApiTokens;
+
+class User extends Authenticatable
+{
+    use HasApiTokens, HasFactory, Notifiable;
+    // ...
+}
+```
+
+Without this trait, `$user->createToken(...)` and
+`$request->user()->currentAccessToken()` simply don't exist — Sanctum's
+token machinery is opt-in per model, not global.
+
+## Step 1 — Login and logout
+
+`app/Http/Controllers/Api/AuthController.php`:
+
+```php
+public function login(Request $request): JsonResponse
+{
+    $credentials = $request->validate([
+        'email' => ['required', 'email'],
+        'password' => ['required', 'string'],
+    ]);
+
+    $user = User::query()->where('email', $credentials['email'])->first();
+
+    if (! $user || ! Hash::check($credentials['password'], $user->password)) {
+        throw ValidationException::withMessages([
+            'email' => ['The provided credentials are incorrect.'],
+        ]);
+    }
+
+    $token = $user->createToken($request->userAgent() ?? 'api-token')->plainTextToken;
+
+    return response()->json(['user' => $user, 'token' => $token]);
+}
+
+public function logout(Request $request): JsonResponse
+{
+    $request->user()->currentAccessToken()->delete();
+
+    return response()->json(['message' => 'Logged out successfully.']);
+}
+```
+
+A few things worth noticing:
+
+- This checks the password by hand with `Hash::check()` instead of
+  `Auth::attempt()`, because `Auth::attempt()` starts a *session* — the
+  whole point here is a stateless request that ends with a token, not a
+  cookie.
+- `createToken()`'s argument is just a human-readable label stored
+  alongside the token (visible in the `personal_access_tokens` table) —
+  passing the User-Agent string means you can tell which device/client
+  issued which token later.
+- `plainTextToken` is only ever available once, at creation time. Sanctum
+  stores a *hash* of the token in the database, the same way passwords
+  are hashed — if you don't hand it back to the client in this response,
+  it's gone for good.
+- `currentAccessToken()` on logout deletes *only* the token used to
+  authenticate this specific request, not every token the user has —
+  logging out on one device shouldn't log you out everywhere.
+
+## Step 2 — Routes
+
+```php
+Route::post('/login', [AuthController::class, 'login']);
+
+Route::middleware('auth:sanctum')->group(function () {
+    Route::get('/user', fn (Request $request) => $request->user());
+    Route::post('/logout', [AuthController::class, 'logout']);
+
+    Route::apiResource('categories', CategoryController::class)->names('api.categories');
+    Route::apiResource('products', ProductController::class)->names('api.products');
+});
+```
+
+`Route::apiResource` is `Route::resource` minus `create`/`edit` — an API
+client doesn't need a route that returns an HTML form, only the five that
+exchange data (`index`/`store`/`show`/`update`/`destroy`).
+
+> **A real bug this app shipped with:** the first version of this file
+> wrote plain `Route::apiResource('categories', ...)` and
+> `Route::apiResource('products', ...)`, no `->names(...)`. That looks
+> harmless, but `Route::resource('categories', ...)` in `routes/web.php`
+> (Part One) and `Route::apiResource('categories', ...)` here generate
+> **identically named routes** — both produce `categories.index`,
+> `categories.store`, and so on. Route names have to be unique across the
+> *entire* application, not per file, and Laravel doesn't warn you when
+> one registration silently overwrites another.
+>
+> Because `bootstrap/app.php` registers `api:` after `web:`, the API
+> routes won — every `route('categories.index')` call anywhere in the
+> app, including the ones in `resources/views/layouts/navigation.blade.php`,
+> started resolving to `/api/categories` instead of `/categories`.
+> Clicking **Categories** in the nav sent a logged-in browser to a route
+> guarded by `auth:sanctum` (which only understands bearer tokens, not
+> session cookies), so the response came back "Unauthenticated" even
+> though the user was clearly logged in.
+>
+> The fix is `->names('api.categories')` / `->names('api.products')`:
+> it renames the whole group of generated routes to
+> `api.categories.index`, `api.categories.store`, etc., so they can no
+> longer collide with the web resource's names. The general lesson:
+> whenever a second route group exposes the *same resource name* as an
+> existing one — API alongside web being the most common case — give one
+> of them an explicit name prefix rather than trusting the defaults not
+> to collide.
+
+## Step 3 — API controllers and resources
+
+`app/Http/Controllers/Api/CategoryController.php` runs the *same* query
+as the web `CategoryController`, but returns a `CategoryResource` instead
+of a `view()`:
+
+```php
+public function index(Request $request): JsonResponse
+{
+    $categories = Category::query()
+        ->withCount('products')
+        ->orderBy('name')
+        ->paginate(10)
+        ->withQueryString();
+
+    return CategoryResource::collection($categories)->response();
+}
+```
+
+`app/Http/Resources/CategoryResource.php` is the JSON equivalent of a
+Blade view — it decides exactly which fields go out over the wire and in
+what shape, instead of leaking whatever columns happen to be on the
+Eloquent model:
+
+```php
+public function toArray(Request $request): array
+{
+    return [
+        'id' => $this->id,
+        'name' => $this->name,
+        'description' => $this->description,
+        'products_count' => $this->whenCounted('products'),
+        'created_at' => $this->created_at,
+        'updated_at' => $this->updated_at,
+    ];
+}
+```
+
+`whenCounted('products')` only includes `products_count` in the response
+when the query actually ran `withCount('products')` — calling
+`CategoryResource::make($category)` from `show()` without a
+`withCount()` first just omits the key instead of returning `null` or
+throwing. `ProductResource` does the same trick with `whenLoaded('category')`
+for its nested category, mirroring the `->with('category')` eager-load
+from Part Two's controller.
+
+Separate API controllers (rather than making the existing web
+controllers return JSON when `Accept: application/json` is sent) is a
+deliberate choice here: the web controllers are typed to return
+`View`/`RedirectResponse`, and their `store`/`update`/`destroy` methods
+redirect with flash messages — behavior an API client has no use for.
+Duplicating the *query* logic (a handful of lines) was cheaper than
+branching every method on response format.
+
+## Checking your work (Part Three)
+
+```bash
+php artisan route:list --path=api   # confirm /api/login plus the guarded routes
+php artisan serve
+```
+
+```bash
+# 1. Log in, capture the token
+curl -X POST http://127.0.0.1:8000/api/login \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
+  -d '{"email":"test@example.com","password":"password"}'
+
+# 2. Use it — replace <token> with the value from step 1
+curl http://127.0.0.1:8000/api/categories \
+  -H "Authorization: Bearer <token>" -H "Accept: application/json"
+
+# 3. Confirm a missing/expired token is rejected
+curl -i http://127.0.0.1:8000/api/categories -H "Accept: application/json"   # expect 401
+
+# 4. Log out, then confirm the same token no longer works
+curl -X POST http://127.0.0.1:8000/api/logout \
+  -H "Authorization: Bearer <token>" -H "Accept: application/json"
+curl -i http://127.0.0.1:8000/api/categories \
+  -H "Authorization: Bearer <token>" -H "Accept: application/json"   # expect 401
+```
+
+Then, separately, log in through the *browser* and click **Categories**
+in the nav — this is the regression check for the route-name bug above.
+If it ever comes back (e.g. a fourth resource gets an unqualified
+`apiResource` name that collides with its web counterpart), this is
+where you'd see it: a page that should render normally instead shows
+"Unauthenticated."
+
+---
+
 ## Your turn: build a third resource on your own
 
-Everything above is one recipe, applied twice. Pick a third resource this
-retail app doesn't have yet — `Supplier` (`name`, `contact_email`,
-`phone`) is a reasonable scope, or invent your own — and build it end to
-end without copying an existing file line-for-line:
+Everything above is one recipe, applied twice, then exposed a second way.
+Pick a third resource this retail app doesn't have yet — `Supplier`
+(`name`, `contact_email`, `phone`) is a reasonable scope, or invent your
+own — and build it end to end without copying an existing file
+line-for-line:
 
 1. `php artisan make:model Supplier -mf`, fill in the migration.
 2. Add `$fillable` and any relationships to the model.
@@ -823,6 +1083,12 @@ end without copying an existing file line-for-line:
 8. Build `index`/`create`/`edit`/`_form` views, reusing the Blade components
    (`x-input-label`, `x-text-input`, `x-input-error`, `x-primary-button`)
    you've now seen twice.
+9. Add the API side from Part Three: an `Api\SupplierController` +
+   `SupplierResource` reusing the same `Store`/`UpdateSupplierRequest`
+   from step 5, and an `apiResource` line in `routes/api.php` inside the
+   `auth:sanctum` group — remember to `->names('api.suppliers')` so it
+   doesn't collide with the web resource's route names from step 7.
 
-If you get through all eight steps without opening `CategoryController.php`
-or `ProductController.php` for reference, the pattern has stuck.
+If you get through all nine steps without opening `CategoryController.php`
+or `ProductController.php` (or their `Api\` counterparts) for reference,
+the pattern has stuck.
